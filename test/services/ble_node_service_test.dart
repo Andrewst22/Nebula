@@ -1,7 +1,34 @@
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:telefonos_mesh/services/ble_node_service.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('refreshScan asks Android to restart BLE discovery', () async {
+    var scanRequested = false;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('org.comunidad.enlace/ble'),
+          (call) async {
+            expect(call.method, 'refreshBleScan');
+            scanRequested = true;
+            return null;
+          },
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('org.comunidad.enlace/ble'),
+            null,
+          ),
+    );
+
+    await BleNodeService().refreshScan();
+
+    expect(scanRequested, isTrue);
+  });
+
   group('BleNodeSnapshot', () {
     test('parses nearby nodes and active state', () {
       final snapshot = BleNodeSnapshot.fromMap({
@@ -33,6 +60,18 @@ void main() {
       });
 
       expect(snapshot.peers!.single.name, 'Casa norte');
+    });
+
+    test('parses Wi-Fi Direct photo transfer status independently of BLE', () {
+      final snapshot = BleNodeSnapshot.fromMap({
+        'wifiTransferStatus': 'Foto compartida con un nodo NEBULA.',
+      });
+
+      expect(snapshot.active, isNull);
+      expect(
+        snapshot.wifiTransferStatus,
+        'Foto compartida con un nodo NEBULA.',
+      );
     });
 
     test('parses alarm events without requiring BLE status fields', () {

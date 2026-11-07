@@ -32,7 +32,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
                 if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
                     "Arranque del teléfono detectado; iniciando servicio BLE."
                 } else {
-                    "Actualización de Enlace detectada; iniciando servicio BLE."
+                    "Actualización de NEBULA detectada; iniciando servicio BLE."
                 },
             )
         } catch (error: SecurityException) {

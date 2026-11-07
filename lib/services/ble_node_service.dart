@@ -4,6 +4,36 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+class PhotoAttachment {
+  const PhotoAttachment({
+    required this.id,
+    required this.path,
+    required this.bytes,
+    required this.mimeType,
+  });
+
+  final String id;
+  final String path;
+  final int bytes;
+  final String mimeType;
+
+  factory PhotoAttachment.fromMap(Object? value) {
+    if (value is! Map<Object?, Object?> ||
+        value['id'] is! String ||
+        value['path'] is! String ||
+        value['bytes'] is! int ||
+        value['mimeType'] is! String) {
+      throw const FormatException('La foto seleccionada no es válida.');
+    }
+    return PhotoAttachment(
+      id: value['id']! as String,
+      path: value['path']! as String,
+      bytes: value['bytes']! as int,
+      mimeType: value['mimeType']! as String,
+    );
+  }
+}
+
 class NearbyNode {
   const NearbyNode({required this.id, required this.name, required this.rssi});
 
@@ -51,6 +81,7 @@ class BleNodeSnapshot {
     this.sourceAddress,
     this.error,
     this.transferStatus,
+    this.wifiTransferStatus,
     this.seismicAlarmMonitoring,
     this.seismicAlarmTriggered,
     this.seismicAlarmError,
@@ -62,6 +93,7 @@ class BleNodeSnapshot {
   final String? sourceAddress;
   final String? error;
   final String? transferStatus;
+  final String? wifiTransferStatus;
   final bool? seismicAlarmMonitoring;
   final bool? seismicAlarmTriggered;
   final String? seismicAlarmError;
@@ -94,6 +126,9 @@ class BleNodeSnapshot {
       error: value['error'] is String ? value['error']! as String : null,
       transferStatus: value['transferStatus'] is String
           ? value['transferStatus']! as String
+          : null,
+      wifiTransferStatus: value['wifiTransferStatus'] is String
+          ? value['wifiTransferStatus']! as String
           : null,
       seismicAlarmMonitoring: monitoring as bool?,
       seismicAlarmTriggered: triggered as bool?,
@@ -149,10 +184,14 @@ class BleNodeService {
       );
     }
 
+    await _requestWifiDirectPermission(androidSdk, required: false);
     await _methodChannel.invokeMethod<void>('startNode');
   }
 
   Future<void> stop() => _methodChannel.invokeMethod<void>('stopNode');
+
+  Future<void> refreshScan() =>
+      _methodChannel.invokeMethod<void>('refreshBleScan');
 
   Future<void> setSeismicAlarmEnabled(bool enabled) => _methodChannel
       .invokeMethod<void>('setSeismicAlarmEnabled', {'enabled': enabled});
@@ -173,7 +212,7 @@ class BleNodeService {
         code: 'location_permission_denied',
         message: foregroundLocation.isPermanentlyDenied
             ? 'El permiso de ubicación está bloqueado. Actívalo en Ajustes > '
-                  'Aplicaciones > Enlace > Permisos.'
+                  'Aplicaciones > NEBULA > Permisos.'
             : 'Concede permiso de ubicación mientras se usa la app para pedir ayuda.',
       );
     }
@@ -183,7 +222,7 @@ class BleNodeService {
         code: 'location_precise_permission_denied',
         message: preciseLocation.isPermanentlyDenied
             ? 'La ubicación precisa está bloqueada. Actívala en Ajustes > '
-                  'Aplicaciones > Enlace > Permisos.'
+                  'Aplicaciones > NEBULA > Permisos.'
             : 'Permite ubicación precisa para compartir coordenadas GPS. '
                   'La ubicación aproximada no es suficiente.',
       );
@@ -279,5 +318,98 @@ class BleNodeService {
       );
     }
     return recipients;
+  }
+
+  Future<PhotoAttachment?> pickPhoto() async {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      throw PlatformException(
+        code: 'android_only',
+        message:
+            'La transferencia Wi-Fi Direct está disponible solo en Android.',
+      );
+    }
+    final androidSdk = await _methodChannel.invokeMethod<int>('getAndroidSdk');
+    if (androidSdk == null) {
+      throw PlatformException(
+        code: 'android_version_unavailable',
+        message: 'No se pudo determinar la versión de Android.',
+      );
+    }
+    await startPhotoTransport(androidSdk: androidSdk);
+    final hasPermission = await _methodChannel.invokeMethod<bool>(
+      'hasWifiDirectPermission',
+    );
+    if (hasPermission != true) {
+      throw PlatformException(
+        code: 'wifi_direct_permission_denied',
+        message: 'Concede el permiso de ubicación para descubrir nodos Wi-Fi cercanos.',
+      );
+    }
+    final value = await _methodChannel.invokeMapMethod<String, Object?>(
+      'pickPhoto',
+    );
+    if (value == null) return null;
+    try {
+      return PhotoAttachment.fromMap(value);
+    } on FormatException catch (error) {
+      throw PlatformException(
+        code: 'photo_pick_invalid',
+        message: error.message,
+      );
+    }
+  }
+
+  Future<void> startPhotoTransport({int? androidSdk}) async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    final sdk =
+        androidSdk ?? await _methodChannel.invokeMethod<int>('getAndroidSdk');
+    if (sdk == null) {
+      throw PlatformException(
+        code: 'android_version_unavailable',
+        message: 'No se pudo determinar la versión de Android.',
+      );
+    }
+    await _requestWifiDirectPermission(sdk, required: true);
+    await _methodChannel.invokeMethod<void>('startPhotoTransport');
+  }
+
+  Future<bool> _requestWifiDirectPermission(
+    int androidSdk, {
+    required bool required,
+  }) async {
+    final permission = androidSdk >= 33
+        ? Permission.nearbyWifiDevices
+        : Permission.locationWhenInUse;
+    final status = await permission.request();
+    if (status.isGranted) return true;
+    if (required) {
+      throw PlatformException(
+        code: androidSdk >= 33
+            ? 'wifi_direct_permission_denied'
+            : 'wifi_direct_location_permission_denied',
+        message: androidSdk >= 33
+            ? 'Concede “Dispositivos Wi-Fi cercanos” a NEBULA para que este nodo reciba y reenvíe fotos.'
+            : 'Concede ubicación mientras se usa NEBULA para descubrir nodos Wi-Fi Direct.',
+      );
+    }
+    return false;
+  }
+
+  Future<void> enqueuePhoto(String id, String reportPayload) async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    await _methodChannel.invokeMethod<void>('enqueuePhoto', {
+      'id': id,
+      'reportPayload': reportPayload,
+    });
+  }
+
+  Future<String?> getPhotoPath(String id) async {
+    if (defaultTargetPlatform != TargetPlatform.android) return null;
+    return _methodChannel.invokeMethod<String>('getPhotoPath', {'id': id});
+  }
+
+  Future<void> openWifiSettings() async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    await _methodChannel.invokeMethod<void>('openWifiSettings');
   }
 }

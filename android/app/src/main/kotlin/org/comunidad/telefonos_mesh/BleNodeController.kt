@@ -28,6 +28,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import io.flutter.plugin.common.MethodChannel
+import org.json.JSONException
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -42,6 +43,8 @@ internal class BleNodeException(val code: String, override val message: String) 
 internal class BleNodeController(
     context: Context,
     private val publishEvent: (Map<String, Any?>) -> Unit,
+    private val pendingPayloadsForPeer: (String) -> List<String>,
+    private val onPayloadDelivered: (String, String) -> Unit,
 ) {
     private data class Peer(
         val id: String,
@@ -66,7 +69,11 @@ internal class BleNodeController(
         var nextFrame: Int = 0,
     )
 
-    private data class PendingSend(val address: String, val payload: ByteArray)
+    private data class PendingSend(
+        val address: String,
+        val payload: String,
+        val attempt: Int = 0,
+    )
 
     private val appContext = context.applicationContext
     private val bluetoothManager =
@@ -77,11 +84,14 @@ internal class BleNodeController(
     private val outgoingTransfers = mutableMapOf<String, OutgoingTransfer>()
     private val clientConnections = mutableMapOf<String, BluetoothGatt>()
     private val pendingSends = ArrayDeque<PendingSend>()
+    private val retryNotBefore = mutableMapOf<String, Long>()
+    private var activeSend: PendingSend? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private var scanner: BluetoothLeScanner? = null
     private var gattServer: BluetoothGattServer? = null
     private var isRunning = false
     private var activeTransferAddress: String? = null
+    private var queueGeneration = 0
     private var nextPeerId = 1
     private var advertisingRestart: Runnable? = null
     private var nodeName: String = appContext.getSharedPreferences(
@@ -161,6 +171,48 @@ internal class BleNodeController(
 
     fun onUiAttached() {
         emitState()
+    }
+
+    @SuppressLint("MissingPermission")
+    @Synchronized
+    fun refreshScan() {
+        if (!isRunning) {
+            throw BleNodeException(
+                "ble_node_inactive",
+                "El nodo BLE no está activo para buscar mensajes.",
+            )
+        }
+        val nodeScanner = scanner
+            ?: throw BleNodeException(
+                "ble_scanning_unavailable",
+                "No se pudo acceder al escáner Bluetooth LE.",
+            )
+        val callback = scanCallback
+            ?: throw BleNodeException(
+                "ble_scanning_unavailable",
+                "No se pudo acceder a la búsqueda Bluetooth LE.",
+            )
+        try {
+            nodeScanner.stopScan(callback)
+            nodeScanner.startScan(
+                listOf(ScanFilter.Builder().setServiceUuid(SERVICE_UUID).build()),
+                ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build(),
+                callback,
+            )
+            emitTransferStatus("Buscando mensajes y nodos BLE cercanos…")
+        } catch (error: SecurityException) {
+            throw BleNodeException(
+                "ble_permission_denied",
+                error.message ?: "Falta permiso para buscar por Bluetooth.",
+            )
+        } catch (error: IllegalStateException) {
+            throw BleNodeException(
+                "ble_scan_refresh_failed",
+                error.message ?: "No se pudo reiniciar la búsqueda Bluetooth.",
+            )
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -346,6 +398,7 @@ internal class BleNodeController(
     fun stop() {
         if (!isRunning && advertiser == null && scanner == null && gattServer == null) return
         isRunning = false
+        queueGeneration += 1
         mainHandler.removeCallbacks(expirePeers)
         cancelAdvertisingRestart()
         advertiseCallback?.let { callback ->
@@ -377,6 +430,8 @@ internal class BleNodeController(
         clientConnections.clear()
         outgoingTransfers.clear()
         pendingSends.clear()
+        retryNotBefore.clear()
+        activeSend = null
         activeTransferAddress = null
         advertiseCallback = null
         scanCallback = null
@@ -413,6 +468,29 @@ internal class BleNodeController(
     }
 
     @SuppressLint("MissingPermission")
+    @Synchronized
+    fun clearPendingSends() {
+        queueGeneration += 1
+        pendingSends.clear()
+        retryNotBefore.clear()
+        activeTransferAddress?.let { address ->
+            val gatt = clientConnections.remove(address)
+            if (gatt != null) {
+                outgoingTransfers.remove(address)
+                negotiatedMtu.remove(address)
+                try {
+                    gatt.disconnect()
+                    gatt.close()
+                } catch (error: SecurityException) {
+                    emitFailure(error.message ?: "No se pudo cancelar una transferencia BLE.")
+                }
+            }
+        }
+        activeSend = null
+        activeTransferAddress = null
+    }
+
+    @SuppressLint("MissingPermission")
     private fun enqueueBroadcast(payload: String, excludedAddress: String?): Int {
         if (!isRunning) {
             throw BleNodeException("ble_node_inactive", "El nodo BLE ya no está activo.")
@@ -428,11 +506,7 @@ internal class BleNodeController(
             .filter { it.address != excludedAddress }
             .map { it.address }
         val newRecipients = recipients.filter { address ->
-            address != activeTransferAddress &&
-                pendingSends.none { it.address == address }
-        }
-        if (newRecipients.isEmpty()) {
-            return 0
+            !isPayloadQueued(address, payload)
         }
         if (pendingSends.size + newRecipients.size > MAX_PENDING_SENDS) {
             throw BleNodeException(
@@ -441,10 +515,37 @@ internal class BleNodeController(
             )
         }
         newRecipients.forEach { address ->
-            pendingSends.add(PendingSend(address, bytes))
+            pendingSends.add(PendingSend(address, payload))
         }
         startNextTransfer()
         return newRecipients.size
+    }
+
+    private fun isPayloadQueued(address: String, payload: String): Boolean =
+        activeSend?.let { it.address == address && it.payload == payload } == true ||
+            pendingSends.any { it.address == address && it.payload == payload }
+
+    @Synchronized
+    private fun enqueuePendingForPeer(address: String) {
+        if (!isRunning) return
+        try {
+            val payloads = pendingPayloadsForPeer(address)
+            val now = System.currentTimeMillis()
+            retryNotBefore.entries.removeAll { it.value <= now }
+            val newPayloads = payloads.filterNot {
+                isPayloadQueued(address, it) ||
+                    (retryNotBefore[retryKey(address, it)] ?: 0L) > now
+            }
+            val availableSlots = (MAX_PENDING_SENDS - pendingSends.size).coerceAtLeast(0)
+            newPayloads.take(availableSlots).forEach {
+                pendingSends.add(PendingSend(address, it))
+            }
+            startNextTransfer()
+        } catch (error: JSONException) {
+            emitFailure(error.message ?: "No se pudo recuperar la cola de avisos BLE.")
+        } catch (error: IllegalStateException) {
+            emitFailure(error.message ?: "No se pudo recuperar la cola de avisos BLE.")
+        }
     }
 
     @Synchronized
@@ -452,7 +553,8 @@ internal class BleNodeController(
         if (!isRunning || activeTransferAddress != null) return
         val next = pendingSends.pollFirst() ?: return
         activeTransferAddress = next.address
-        connectAndSend(next.address, next.payload)
+        activeSend = next
+        connectAndSend(next.address, next.payload.toByteArray(StandardCharsets.UTF_8))
     }
 
     @SuppressLint("MissingPermission")
@@ -651,6 +753,7 @@ internal class BleNodeController(
     @Synchronized
     private fun finishTransfer(address: String, gatt: BluetoothGatt, error: String?) {
         if (clientConnections[address] !== gatt) return
+        val completedSend = activeSend?.takeIf { it.address == address }
         clientConnections.remove(address)
         outgoingTransfers.remove(address)
         negotiatedMtu.remove(address)
@@ -660,7 +763,31 @@ internal class BleNodeController(
         } catch (closeError: SecurityException) {
             emitFailure(closeError.message ?: "No se pudo cerrar una conexión GATT.")
         }
-        if (error != null) emitFailure(error)
+        if (error != null) {
+            emitFailure(error)
+            retrySend(completedSend)
+        } else if (completedSend != null) {
+            var deliveryRecorded = false
+            try {
+                onPayloadDelivered(completedSend.payload, address)
+                deliveryRecorded = true
+            } catch (callbackError: JSONException) {
+                emitFailure(
+                    callbackError.message ?: "No se pudo confirmar el envío BLE.",
+                )
+            } catch (callbackError: IllegalStateException) {
+                emitFailure(
+                    callbackError.message ?: "No se pudo confirmar el envío BLE.",
+                )
+            }
+            val key = retryKey(address, completedSend.payload)
+            if (deliveryRecorded) {
+                retryNotBefore.remove(key)
+            } else {
+                retryNotBefore[key] = System.currentTimeMillis() + MAX_RETRY_COOLDOWN_MS
+            }
+        }
+        activeSend = null
         if (activeTransferAddress == address) activeTransferAddress = null
         startNextTransfer()
     }
@@ -668,10 +795,46 @@ internal class BleNodeController(
     @Synchronized
     private fun completeQueuedTransfer(address: String, error: String) {
         if (activeTransferAddress != address) return
+        val failedSend = activeSend?.takeIf { it.address == address }
+        activeSend = null
         activeTransferAddress = null
         emitFailure(error)
+        retrySend(failedSend)
         startNextTransfer()
     }
+
+    private fun retrySend(send: PendingSend?) {
+        if (send == null || !isRunning) return
+        val key = retryKey(send.address, send.payload)
+        if (send.attempt >= MAX_SEND_RETRIES) {
+            retryNotBefore[key] = System.currentTimeMillis() + MAX_RETRY_COOLDOWN_MS
+            return
+        }
+        val delay = RETRY_DELAY_MS * (send.attempt + 1)
+        retryNotBefore[key] = System.currentTimeMillis() + delay
+        val generation = queueGeneration
+        mainHandler.postDelayed({
+            synchronized(this@BleNodeController) {
+                if (!isRunning || generation != queueGeneration ||
+                    isPayloadQueued(send.address, send.payload)
+                ) {
+                    return@synchronized
+                }
+                if (pendingSends.size >= MAX_PENDING_SENDS) {
+                    emitFailure("La cola BLE está llena; se reintentará al detectar vecinos.")
+                    return@synchronized
+                }
+                retryNotBefore.remove(key)
+                pendingSends.add(
+                    PendingSend(send.address, send.payload, send.attempt + 1),
+                )
+                startNextTransfer()
+            }
+        }, RETRY_DELAY_MS * (send.attempt + 1))
+    }
+
+    private fun retryKey(address: String, payload: String): String =
+        "$address:$payload"
 
     @Synchronized
     private fun acceptFrame(address: String, frame: ByteArray): Boolean {
@@ -769,11 +932,12 @@ internal class BleNodeController(
                     ?.takeIf { it.isNotEmpty() }
                 peers[deviceAddress] = Peer(
                     id = existingPeer?.id ?: "Nodo ${nextPeerId++}",
-                    name = advertisedName ?: existingPeer?.name ?: "Enlace nodo",
+                    name = advertisedName ?: existingPeer?.name ?: "NEBULA",
                     address = deviceAddress,
                     rssi = result.rssi,
                     lastSeen = System.currentTimeMillis(),
                 )
+                enqueuePendingForPeer(deviceAddress)
             }
             emitState()
         }
@@ -818,7 +982,7 @@ internal class BleNodeController(
     companion object {
         internal const val NODE_IDENTITY_PREFERENCES = "enlace_node_identity"
         internal const val NODE_NAME_KEY = "display_name"
-        private const val DEFAULT_NODE_NAME = "Enlace nodo"
+        private const val DEFAULT_NODE_NAME = "NEBULA"
         internal const val MAX_NODE_NAME_BYTES = 12
         private const val ADVERTISE_RESTART_DELAY_MS = 300L
         private const val PEER_TIMEOUT_MS = 15_000L
@@ -830,6 +994,9 @@ internal class BleNodeController(
         private const val MAX_FRAME_COUNT = 512
         private const val MAX_ASSEMBLIES = 8
         private const val MAX_PENDING_SENDS = 64
+        private const val MAX_SEND_RETRIES = 3
+        private const val RETRY_DELAY_MS = 1_500L
+        private const val MAX_RETRY_COOLDOWN_MS = 15_000L
         private const val PREFERRED_MTU = 247
         private const val DEFAULT_MTU = 23
         private val SERVICE_UUID = ParcelUuid(

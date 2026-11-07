@@ -248,6 +248,10 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('quick-report-missing-person')));
       await tester.pumpAndSettle();
+      expect(
+        find.byKey(const Key('select-missing-person-photo')),
+        findsOneWidget,
+      );
       await tester.enterText(
         find.byKey(const Key('missing-person-name')),
         'Ana',
@@ -331,6 +335,106 @@ void main() {
       expect(find.textContaining('URGENTE · GUARDADO LOCAL'), findsNWidgets(2));
     },
   );
+
+  testWidgets('robbery report can attach an evidence photo', (tester) async {
+    tester.view.physicalSize = const Size(800, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('org.comunidad.enlace/ble'),
+          (call) async {
+            switch (call.method) {
+              case 'getBackgroundMessages':
+                return <String>[];
+              case 'getAutoStartDiagnostics':
+                return <String, Object>{
+                  'status': 'Sin evento de arranque registrado.',
+                  'timestamp': 0,
+                  'autoStartEnabled': false,
+                };
+              case 'getAndroidSdk':
+                return 35;
+              case 'hasWifiDirectPermission':
+                return true;
+              case 'pickPhoto':
+                return <String, Object>{
+                  'id': 'a' * 32,
+                  'path':
+                      'android/app/src/main/res/mipmap-mdpi/ic_launcher.png',
+                  'bytes': 1024,
+                  'mimeType': 'image/png',
+                };
+              case 'getCurrentGpsLocation':
+                return <String, Object>{
+                  'latitude': 10.123456,
+                  'longitude': -66.987654,
+                  'accuracyMeters': 8.0,
+                };
+              default:
+                return null;
+            }
+          },
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('org.comunidad.enlace/ble'),
+            null,
+          ),
+    );
+    const permissionChannel = MethodChannel(
+      'flutter.baseflow.com/permissions/methods',
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(permissionChannel, (call) async {
+          if (call.method == 'requestPermissions') {
+            final requested = call.arguments as List<Object?>;
+            return {for (final permission in requested) permission! as int: 1};
+          }
+          if (call.method == 'checkServiceStatus') return 1;
+          return null;
+        });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(permissionChannel, null),
+    );
+    SharedPreferences.setMockInitialValues({});
+    await tester.pumpWidget(const EnlaceApp());
+    await tester.pumpAndSettle();
+
+    await tester.ensureVisible(find.byKey(const Key('quick-report-robbery')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('quick-report-robbery')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('select-robbery-photo')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('select-robbery-photo')));
+    await tester.pumpAndSettle();
+    expect(find.text('Cambiar foto'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('continue-robbery-report')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('GPS: 10.123456, -66.987654'), findsOneWidget);
+    expect(
+      find.textContaining('La foto también se compartirá'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byKey(const Key('confirm-quick-alert')));
+    await tester.pumpAndSettle();
+
+    final savedMessages = jsonDecode(
+      (await SharedPreferences.getInstance()).getString(
+        'enlace.local_messages.v1',
+      )!,
+    ) as List<Object?>;
+    final savedMessage = savedMessages.single! as Map<String, Object?>;
+    expect(savedMessage['text'], contains('ROBO EN CASA'));
+    expect(savedMessage['photoId'], 'a' * 32);
+    expect(savedMessage['photoMimeType'], 'image/png');
+    expect(savedMessage['photoBytes'], 1024);
+  });
 
   testWidgets(
     'quick fire report includes GPS coordinates before confirmation',
@@ -483,6 +587,7 @@ void main() {
 
     await tester.drag(find.byType(CustomScrollView), const Offset(0, -1200));
     await tester.pumpAndSettle();
+    expect(find.byKey(const Key('refresh-messages')), findsOneWidget);
     await tester.ensureVisible(find.byKey(const Key('clear-all-messages')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('clear-all-messages')));

@@ -53,13 +53,21 @@ internal class BleStoredMessageStore(context: Context) {
         }
 
         val messages = readMessages()
-        if (messages.any { it.optString("id") == id }) return null
+        messages.firstOrNull { it.optString("id") == id }?.let { existing ->
+            if (existing.optBoolean("forwardable", false)) {
+                enqueueOutbound(existing.toString())
+            }
+            return null
+        }
 
         val received = JSONObject(message.toString())
         received.put("received", true)
         val forwarded = if (remainingHops > 1) {
-            JSONObject(received.toString()).put("remainingHops", remainingHops - 1)
+            JSONObject(received.toString())
+                .put("remainingHops", remainingHops - 1)
+                .put("forwardable", true)
         } else {
+            received.put("forwardable", false)
             null
         }
         val stored = forwarded ?: received
@@ -74,10 +82,84 @@ internal class BleStoredMessageStore(context: Context) {
         if (!committed) {
             throw IllegalStateException("No se pudo guardar el aviso recibido.")
         }
+        if (forwarded != null) enqueueOutbound(forwarded.toString())
         return StoredBleMessage(
             forwardedPayload = forwarded?.toString(),
             text = text,
         )
+    }
+
+    @Synchronized
+    @Throws(JSONException::class)
+    fun enqueueOutbound(payload: String) {
+        if (payload.toByteArray(Charsets.UTF_8).size > MAX_MESSAGE_BYTES) {
+            throw JSONException("El aviso excede el tamaño permitido.")
+        }
+        val message = JSONObject(payload)
+        val id = message.optString("id")
+        val text = message.optString("text")
+        val priority = message.optString("priority")
+        val createdAt = parseTimestamp(message.optString("createdAt"))
+        val expiry = parseTimestamp(message.optString("expiresAt"))
+        val hops = message.optInt("remainingHops", -1)
+        val now = System.currentTimeMillis()
+        if (!MESSAGE_ID.matches(id) || text.isBlank() || text.length > MAX_TEXT_LENGTH ||
+            (priority != "normal" && priority != "urgent") ||
+            createdAt == null || expiry == null ||
+            expiry <= now || expiry <= createdAt ||
+            expiry - createdAt > MAX_MESSAGE_AGE_MS ||
+            createdAt > now + MAX_FUTURE_SKEW_MS ||
+            hops !in 1..MAX_HOPS
+        ) {
+            throw JSONException("El aviso pendiente no cumple el formato permitido.")
+        }
+        val records = readOutbox().filter {
+            (parseTimestamp(it.optString("expiresAt")) ?: 0L) > System.currentTimeMillis()
+        }
+        if (records.any { it.optString("id") == id }) return
+        val retained = records.takeLast(MAX_OUTBOX_MESSAGES - 1)
+        val updated = JSONArray()
+        retained.forEach(updated::put)
+        updated.put(
+            JSONObject()
+                .put("id", id)
+                .put("payload", payload)
+                .put("expiresAt", message.optString("expiresAt"))
+                .put("deliveredTo", JSONArray()),
+        )
+        commitOutbox(updated)
+    }
+
+    @Synchronized
+    @Throws(JSONException::class)
+    fun pendingForPeer(address: String): List<String> {
+        val now = System.currentTimeMillis()
+        return readOutbox()
+            .filter { (parseTimestamp(it.optString("expiresAt")) ?: 0L) > now }
+            .filterNot { record ->
+                val peers = record.optJSONArray("deliveredTo") ?: JSONArray()
+                (0 until peers.length()).any { peers.optString(it) == address }
+            }
+            .map { it.optString("payload") }
+    }
+
+    @Synchronized
+    @Throws(JSONException::class)
+    fun markDelivered(payload: String, address: String) {
+        val id = JSONObject(payload).optString("id")
+        if (!MESSAGE_ID.matches(id)) return
+        val updated = JSONArray()
+        readOutbox().forEach { record ->
+            if (record.optString("id") == id) {
+                val peers = record.optJSONArray("deliveredTo") ?: JSONArray()
+                if ((0 until peers.length()).none { peers.optString(it) == address }) {
+                    peers.put(address)
+                }
+                record.put("deliveredTo", peers)
+            }
+            updated.put(record)
+        }
+        commitOutbox(updated)
     }
 
     @Synchronized
@@ -90,8 +172,23 @@ internal class BleStoredMessageStore(context: Context) {
     }
 
     @Synchronized
+    @Throws(JSONException::class)
+    fun forwardingPayload(id: String): String? {
+        if (!MESSAGE_ID.matches(id)) return null
+        return readMessages().firstOrNull { it.optString("id") == id }
+            ?.takeIf {
+                it.optBoolean("forwardable", false) &&
+                    (parseTimestamp(it.optString("expiresAt")) ?: 0L) > System.currentTimeMillis()
+            }
+            ?.toString()
+    }
+
+    @Synchronized
     fun clearMessages() {
-        val committed = preferences.edit().remove(MESSAGES_KEY).commit()
+        val committed = preferences.edit()
+            .remove(MESSAGES_KEY)
+            .remove(OUTBOX_KEY)
+            .commit()
         if (!committed) {
             throw IllegalStateException("No se pudo borrar el historial de mensajes.")
         }
@@ -103,6 +200,21 @@ internal class BleStoredMessageStore(context: Context) {
         return (0 until json.length()).map { index ->
             json.optJSONObject(index)
                 ?: throw JSONException("La lista de avisos guardados está dañada.")
+        }
+    }
+
+    private fun readOutbox(): List<JSONObject> {
+        val encoded = preferences.getString(OUTBOX_KEY, null) ?: return emptyList()
+        val json = JSONArray(encoded)
+        return (0 until json.length()).map { index ->
+            json.optJSONObject(index)
+                ?: throw JSONException("La cola de avisos está dañada.")
+        }
+    }
+
+    private fun commitOutbox(records: JSONArray) {
+        if (!preferences.edit().putString(OUTBOX_KEY, records.toString()).commit()) {
+            throw IllegalStateException("No se pudo guardar la cola de reenvío BLE.")
         }
     }
 
@@ -121,11 +233,13 @@ internal class BleStoredMessageStore(context: Context) {
     companion object {
         private const val PREFERENCES_NAME = "enlace_ble_messages"
         private const val MESSAGES_KEY = "messages"
+        private const val OUTBOX_KEY = "outbox"
         private const val TIMESTAMP_PATTERN = "yyyy-MM-dd'T'HH:mm:ss"
         private const val MAX_MESSAGE_BYTES = 6_144
         private const val MAX_TEXT_LENGTH = 280
         private const val MAX_HOPS = 8
         private const val MAX_STORED_MESSAGES = 500
+        private const val MAX_OUTBOX_MESSAGES = 500
         private const val MAX_MESSAGE_AGE_MS = 24 * 60 * 60 * 1000L
         private const val MAX_FUTURE_SKEW_MS = 5 * 60 * 1000L
         private val MESSAGE_ID = Regex("^[a-f0-9]{32}$")

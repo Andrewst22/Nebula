@@ -15,6 +15,7 @@ import android.hardware.SensorManager
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.RingtoneManager
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -35,6 +36,7 @@ internal object BleNodeRuntime {
         "seismicAlarmMonitoring" to false,
         "seismicAlarmTriggered" to false,
     )
+    private var wifiTransferState: Map<String, Any?> = emptyMap()
     var controller: BleNodeController? = null
         private set
 
@@ -46,6 +48,7 @@ internal object BleNodeRuntime {
         eventSink = sink
         if (sink != null) {
             publishEvent(seismicAlarmState)
+            if (wifiTransferState.isNotEmpty()) publishEvent(wifiTransferState)
             controller?.onUiAttached()
         }
     }
@@ -66,12 +69,24 @@ internal object BleNodeRuntime {
     fun publishEvent(event: Map<String, Any?>) {
         mainHandler.post { eventSink?.success(event) }
     }
+
+    fun publishWifiTransferStatus(message: String) {
+        wifiTransferState = mapOf("wifiTransferStatus" to message)
+        publishEvent(wifiTransferState)
+    }
+}
+
+internal object WifiDirectPhotoRuntime {
+    @Volatile
+    var transport: WifiDirectPhotoTransport? = null
 }
 
 class BleNodeForegroundService : Service(), SensorEventListener {
     private lateinit var notificationManager: NotificationManager
     private lateinit var storedMessageStore: BleStoredMessageStore
+    private lateinit var photoStore: NebulaPhotoStore
     private var nodeController: BleNodeController? = null
+    private var photoTransport: WifiDirectPhotoTransport? = null
     private var foregroundStarted = false
     private var retryAttempt = 0
     private var sensorManager: SensorManager? = null
@@ -92,9 +107,29 @@ class BleNodeForegroundService : Service(), SensorEventListener {
         super.onCreate()
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         storedMessageStore = BleStoredMessageStore(this)
+        photoStore = NebulaPhotoStore(this)
+        photoTransport = if (getSystemService(Context.WIFI_P2P_SERVICE) is WifiP2pManager) {
+            WifiDirectPhotoTransport(this, photoStore) { payload ->
+                val event = mapOf("payload" to payload)
+                val forwardedPayload = processIncomingMessage(event, payload)
+                PhotoReportRelay(accepted = true, forwardPayload = forwardedPayload)
+            }.also {
+                WifiDirectPhotoRuntime.transport = it
+            }
+        } else {
+            BleNodeRuntime.publishWifiTransferStatus(
+                "Este teléfono no ofrece Wi-Fi Direct; los avisos BLE siguen disponibles.",
+            )
+            null
+        }
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         createNotificationChannels()
-        val controller = BleNodeController(this, ::onNodeEvent)
+        val controller = BleNodeController(
+            this,
+            ::onNodeEvent,
+            storedMessageStore::pendingForPeer,
+            storedMessageStore::markDelivered,
+        )
         nodeController = controller
         BleNodeRuntime.attachController(controller)
     }
@@ -107,6 +142,7 @@ class BleNodeForegroundService : Service(), SensorEventListener {
                     if (!foregroundStarted) {
                         enterForeground()
                         startNode()
+                        photoTransport?.start()
                     }
                     startSeismicMonitoring()
                 } else {
@@ -122,6 +158,11 @@ class BleNodeForegroundService : Service(), SensorEventListener {
                 stopNode()
                 return START_NOT_STICKY
             }
+            ACTION_START_WIFI_PHOTOS -> {
+                enterForeground()
+                photoTransport?.start()
+                return START_STICKY
+            }
             ACTION_START, null -> {
                 if (intent == null && !shouldAutoStartAfterBoot(this)) {
                     stopSelf(startId)
@@ -129,6 +170,7 @@ class BleNodeForegroundService : Service(), SensorEventListener {
                 }
                 enterForeground()
                 startNode()
+                photoTransport?.start()
                 if (isSeismicAlarmEnabled()) startSeismicMonitoring()
                 return START_STICKY
             }
@@ -145,6 +187,9 @@ class BleNodeForegroundService : Service(), SensorEventListener {
         serviceHandler.removeCallbacks(retryNodeStart)
         stopSeismicMonitoring()
         silenceSeismicAlarm()
+        photoTransport?.stop()
+        photoTransport = null
+        WifiDirectPhotoRuntime.transport = null
         nodeController?.stop()
         nodeController = null
         BleNodeRuntime.attachController(null)
@@ -416,26 +461,50 @@ class BleNodeForegroundService : Service(), SensorEventListener {
         }
     }
 
-    private fun processIncomingMessage(event: Map<String, Any?>, payload: String) {
+    private fun processIncomingMessage(
+        event: Map<String, Any?>,
+        payload: String,
+    ): String? {
         val stored = try {
             storedMessageStore.accept(payload)
         } catch (error: JSONException) {
             publishInvalidMessage(event, error.message ?: "El aviso recibido no es válido.")
-            return
+            return null
         } catch (error: IllegalStateException) {
             publishInvalidMessage(
                 event,
                 error.message ?: "No se pudo guardar el aviso recibido.",
             )
-            return
+            return null
         }
-        if (stored == null) return
+        if (stored == null) {
+            return try {
+                storedMessageStore.forwardingPayload(JSONObject(payload).optString("id"))
+                    ?.also { forwarded ->
+                        (event["sourceAddress"] as? String)?.let { source ->
+                            storedMessageStore.markDelivered(forwarded, source)
+                        }
+                    }
+            } catch (error: JSONException) {
+                publishInvalidMessage(
+                    event,
+                    error.message ?: "No se pudo confirmar el reenvío del aviso.",
+                )
+                null
+            } catch (error: IllegalStateException) {
+                publishInvalidMessage(
+                    event,
+                    error.message ?: "No se pudo confirmar el reenvío del aviso.",
+                )
+                null
+            }
+        }
 
         BleNodeRuntime.publishEvent(event)
         val summary = summarizeMessage(payload)
         val messageNotification = newNotificationBuilder(MESSAGE_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle("Aviso recibido por Enlace")
+            .setContentTitle("Aviso recibido por NEBULA")
             .setContentText(summary)
             .setStyle(Notification.BigTextStyle().bigText(summary))
             .setContentIntent(openAppIntent())
@@ -444,8 +513,26 @@ class BleNodeForegroundService : Service(), SensorEventListener {
         notificationManager.notify(nextMessageNotificationId(), messageNotification)
         val sourceAddress = event["sourceAddress"] as? String
         stored.forwardedPayload?.let { forwarded ->
+            try {
+                if (sourceAddress != null) {
+                    storedMessageStore.markDelivered(forwarded, sourceAddress)
+                }
+            } catch (error: JSONException) {
+                publishInvalidMessage(
+                    event,
+                    error.message ?: "No se pudo confirmar el reenvío del aviso.",
+                )
+                return null
+            } catch (error: IllegalStateException) {
+                publishInvalidMessage(
+                    event,
+                    error.message ?: "No se pudo confirmar el reenvío del aviso.",
+                )
+                return null
+            }
             nodeController?.broadcastForward(forwarded, sourceAddress)
         }
+        return stored.forwardedPayload
     }
 
     private fun publishInvalidMessage(event: Map<String, Any?>, message: String) {
@@ -474,7 +561,7 @@ class BleNodeForegroundService : Service(), SensorEventListener {
     private fun buildServiceNotification(text: String): Notification =
         newNotificationBuilder(SERVICE_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("Enlace · nodo fijo")
+            .setContentTitle("NEBULA · nodo fijo")
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -504,7 +591,7 @@ class BleNodeForegroundService : Service(), SensorEventListener {
         notificationManager.createNotificationChannel(
             NotificationChannel(
                 SERVICE_CHANNEL_ID,
-                "Estado de la red Enlace",
+                "Estado de la red NEBULA",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply {
                 description = "Indica que este teléfono está funcionando como nodo fijo."
@@ -549,6 +636,7 @@ class BleNodeForegroundService : Service(), SensorEventListener {
     companion object {
         const val ACTION_START = "org.comunidad.telefonos_mesh.START_NODE"
         const val ACTION_STOP = "org.comunidad.telefonos_mesh.STOP_NODE"
+        const val ACTION_START_WIFI_PHOTOS = "org.comunidad.telefonos_mesh.START_WIFI_PHOTOS"
         const val ACTION_SET_SEISMIC_ALARM = "org.comunidad.telefonos_mesh.SET_SEISMIC_ALARM"
         const val ACTION_SILENCE_SEISMIC_ALARM =
             "org.comunidad.telefonos_mesh.SILENCE_SEISMIC_ALARM"

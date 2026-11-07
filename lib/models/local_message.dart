@@ -11,6 +11,9 @@ class LocalMessage {
     required this.createdAt,
     required this.expiresAt,
     required this.remainingHops,
+    this.photoId,
+    this.photoMimeType,
+    this.photoBytes,
     this.senderName,
     this.senderLocalTime,
     this.received = false,
@@ -20,6 +23,9 @@ class LocalMessage {
     required String text,
     required MessagePriority priority,
     DateTime? createdAt,
+    String? photoId,
+    String? photoMimeType,
+    int? photoBytes,
   }) {
     final senderMoment = createdAt ?? DateTime.now();
     final now = senderMoment.toUtc();
@@ -35,6 +41,9 @@ class LocalMessage {
       createdAt: now,
       expiresAt: now.add(const Duration(hours: 24)),
       remainingHops: 8,
+      photoId: photoId,
+      photoMimeType: photoMimeType,
+      photoBytes: photoBytes,
       senderLocalTime: _formatSenderLocalTime(senderMoment),
     );
   }
@@ -53,6 +62,9 @@ class LocalMessage {
     final remainingHops = value['remainingHops'];
     final senderName = value['senderName'];
     final senderLocalTime = value['senderLocalTime'];
+    final photoId = value['photoId'];
+    final photoMimeType = value['photoMimeType'];
+    final photoBytes = value['photoBytes'];
     final received = value['received'] ?? false;
     final createdAt = createdAtValue is String
         ? DateTime.tryParse(createdAtValue)
@@ -82,6 +94,17 @@ class LocalMessage {
             (senderLocalTime is! String ||
                 !RegExp(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC[+-]\d{2}:\d{2}$')
                     .hasMatch(senderLocalTime))) ||
+        (photoId != null &&
+            (photoId is! String ||
+                !RegExp(r'^[a-f0-9]{32}$').hasMatch(photoId) ||
+                photoBytes is! int ||
+                photoBytes < 1 ||
+                photoBytes > 5 * 1024 * 1024 ||
+                photoMimeType is! String ||
+                !const {'image/jpeg', 'image/png', 'image/webp'}
+                    .contains(photoMimeType))) ||
+        (photoId == null &&
+            (photoMimeType != null || photoBytes != null)) ||
         received is! bool ||
         priority.isEmpty) {
       throw const FormatException(
@@ -96,6 +119,9 @@ class LocalMessage {
       createdAt: createdAt,
       expiresAt: expiresAt,
       remainingHops: remainingHops,
+      photoId: photoId as String?,
+      photoMimeType: photoMimeType as String?,
+      photoBytes: photoBytes as int?,
       senderName: senderName as String?,
       senderLocalTime: senderLocalTime as String?,
       received: received,
@@ -108,6 +134,9 @@ class LocalMessage {
   final DateTime createdAt;
   final DateTime expiresAt;
   final int remainingHops;
+  final String? photoId;
+  final String? photoMimeType;
+  final int? photoBytes;
   final String? senderName;
   final String? senderLocalTime;
   final bool received;
@@ -122,6 +151,9 @@ class LocalMessage {
     createdAt: createdAt,
     expiresAt: expiresAt,
     remainingHops: remainingHops,
+    photoId: photoId,
+    photoMimeType: photoMimeType,
+    photoBytes: photoBytes,
     senderName: senderName,
     senderLocalTime: senderLocalTime,
     received: true,
@@ -134,6 +166,9 @@ class LocalMessage {
     createdAt: createdAt,
     expiresAt: expiresAt,
     remainingHops: remainingHops,
+    photoId: photoId,
+    photoMimeType: photoMimeType,
+    photoBytes: photoBytes,
     senderName: name,
     senderLocalTime: senderLocalTime,
     received: received,
@@ -150,6 +185,9 @@ class LocalMessage {
       createdAt: createdAt,
       expiresAt: expiresAt,
       remainingHops: remainingHops - 1,
+      photoId: photoId,
+      photoMimeType: photoMimeType,
+      photoBytes: photoBytes,
       senderName: senderName,
       senderLocalTime: senderLocalTime,
       received: true,
@@ -163,6 +201,9 @@ class LocalMessage {
     'createdAt': createdAt.toIso8601String(),
     'expiresAt': expiresAt.toIso8601String(),
     'remainingHops': remainingHops,
+    'photoId': photoId,
+    'photoMimeType': photoMimeType,
+    'photoBytes': photoBytes,
     'senderName': senderName,
     'senderLocalTime': senderLocalTime,
     'received': received,

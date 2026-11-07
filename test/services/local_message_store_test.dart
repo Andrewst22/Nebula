@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:telefonos_mesh/models/local_message.dart';
@@ -23,6 +25,40 @@ void main() {
     expect(decoded.id, source.id);
     expect(decoded.senderName, 'Casa norte');
     expect(decoded.senderLocalTime, source.senderLocalTime);
+  });
+
+  test('preserves a photo attachment through BLE-style forwarding', () {
+    final source = LocalMessage.create(
+      text: 'MASCOTA DESAPARECIDA',
+      priority: MessagePriority.urgent,
+      photoId: 'a' * 32,
+      photoMimeType: 'image/jpeg',
+      photoBytes: 1024,
+    ).withSenderName('Casa norte');
+
+    final forwarded = LocalMessage.fromJson(
+      jsonDecode(source.forForwarding().encode()),
+    );
+
+    expect(forwarded.photoId, source.photoId);
+    expect(forwarded.photoMimeType, 'image/jpeg');
+    expect(forwarded.photoBytes, 1024);
+    expect(forwarded.remainingHops, 7);
+  });
+
+  test('rejects photo attachments exceeding the five megabyte limit', () {
+    final message = LocalMessage.create(
+      text: 'MASCOTA DESAPARECIDA',
+      priority: MessagePriority.urgent,
+      photoId: 'b' * 32,
+      photoMimeType: 'image/png',
+      photoBytes: 5 * 1024 * 1024 + 1,
+    );
+
+    expect(
+      () => LocalMessage.fromJson(message.toJson()),
+      throwsFormatException,
+    );
   });
 
   test(

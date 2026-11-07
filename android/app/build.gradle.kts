@@ -4,6 +4,10 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+dependencies {
+    implementation("androidx.exifinterface:exifinterface:1.4.1")
+}
+
 android {
     namespace = "org.comunidad.telefonos_mesh"
     compileSdk = flutter.compileSdkVersion

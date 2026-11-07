@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -39,7 +40,7 @@ class _EnlaceAppState extends State<EnlaceApp> {
   Widget build(BuildContext context) {
     const forest = Color(0xFF145B49);
     return MaterialApp(
-      title: 'Enlace',
+      title: 'NEBULA',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
@@ -104,6 +105,7 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
   String? _transferStatus;
   List<NearbyNode> _nearbyNodes = [];
   bool _loadingMessages = true;
+  bool _refreshingMessages = false;
   bool _bleActive = false;
   bool _bleStarting = false;
   bool _autoStartFixedNode = false;
@@ -115,7 +117,7 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
   bool _seismicAlarmMonitoring = false;
   bool _seismicAlarmTriggered = false;
   bool _savingSeismicAlarm = false;
-  String _nodeName = 'Enlace nodo';
+  String _nodeName = 'NEBULA';
   String? _autoStartDiagnostic;
   String? _seismicAlarmError;
   final List<LocalMessage> _messages = [];
@@ -380,7 +382,7 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
       final autoStart = preferences.getBool('auto_start_fixed_node') ?? false;
       final seismicAlarmEnabled =
           preferences.getBool('seismic_alarm_enabled') ?? false;
-      final savedNodeName = preferences.getString('node_name') ?? 'Enlace nodo';
+      final savedNodeName = preferences.getString('node_name') ?? 'NEBULA';
       String? autoStartDiagnostic;
       try {
         final diagnostic = await _bleNodeService.getAutoStartDiagnostics();
@@ -461,6 +463,20 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
         _messages.insert(0, attributedMessage);
         if (_messages.length > 500) _messages.removeLast();
       });
+      if (attributedMessage.photoId != null) {
+        try {
+          await _bleNodeService.enqueuePhoto(
+            attributedMessage.photoId!,
+            attributedMessage.encode(),
+          );
+        } on PlatformException catch (error) {
+          _showTransferStatus(
+            'Reporte guardado, pero no se puso la foto en cola: '
+            '${error.message ?? 'error de almacenamiento'}.',
+          );
+          return;
+        }
+      }
       if (_bleActive) {
         await _broadcastMessage(attributedMessage);
       } else {
@@ -506,10 +522,20 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
   Future<void> _reportHomeIncident({
     required String title,
     required String alertText,
+    bool allowEvidencePhoto = false,
   }) async {
     if (_sendingQuickAlert) return;
     setState(() => _sendingQuickAlert = true);
     try {
+      PhotoAttachment? photo;
+      if (allowEvidencePhoto) {
+        final selection = await showDialog<_IncidentEvidenceSelection>(
+          context: context,
+          builder: (context) => const _IncidentEvidenceDialog(),
+        );
+        if (selection == null || !mounted) return;
+        photo = selection.photo;
+      }
       final location = await _bleNodeService.getCurrentGpsLocation();
       if (!mounted) return;
       final text = _formatIncidentAlert(alertText, location);
@@ -517,10 +543,17 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
         title: 'Confirmar alerta',
         text: text,
         accuracyMeters: location.accuracyMeters,
+        photoIncluded: photo != null,
       );
       if (confirmed && mounted) {
         await _saveAndShareMessage(
-          LocalMessage.create(text: text, priority: MessagePriority.urgent),
+          LocalMessage.create(
+            text: text,
+            priority: MessagePriority.urgent,
+            photoId: photo?.id,
+            photoMimeType: photo?.mimeType,
+            photoBytes: photo?.bytes,
+          ),
         );
       }
     } on PlatformException catch (error) {
@@ -572,10 +605,17 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
     final confirmed = await _confirmQuickAlert(
       title: 'Confirmar reporte',
       text: text,
+      photoIncluded: details.photo != null,
     );
     if (confirmed && mounted) {
       await _saveAndShareMessage(
-        LocalMessage.create(text: text, priority: MessagePriority.urgent),
+        LocalMessage.create(
+          text: text,
+          priority: MessagePriority.urgent,
+          photoId: details.photo?.id,
+          photoMimeType: details.photo?.mimeType,
+          photoBytes: details.photo?.bytes,
+        ),
       );
     }
   }
@@ -603,6 +643,7 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
     required String title,
     required String text,
     double? accuracyMeters,
+    bool photoIncluded = false,
   }) async {
     return await showDialog<bool>(
           context: context,
@@ -618,6 +659,14 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
                     'pueden retransmitirlo a otros teléfonos; no se contacta '
                     'automáticamente a emergencias.',
                   ),
+                  if (photoIncluded) ...[
+                    const SizedBox(height: 10),
+                    const Text(
+                      'La foto también se compartirá con los nodos NEBULA '
+                      'cercanos y podrá reenviarse durante 24 horas. No es '
+                      'privada y puede tardar en llegar.',
+                    ),
+                  ],
                   const SizedBox(height: 12),
                   SelectableText(text),
                   if (accuracyMeters != null) ...[
@@ -638,7 +687,7 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
               FilledButton(
                 key: const Key('confirm-quick-alert'),
                 onPressed: () => Navigator.pop(context, true),
-                child: const Text('Compartir por Enlace'),
+                child: const Text('Compartir por NEBULA'),
               ),
             ],
           ),
@@ -664,6 +713,9 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
       if (snapshot.error != null) _bleError = snapshot.error;
       if (snapshot.transferStatus != null) {
         _transferStatus = snapshot.transferStatus;
+      }
+      if (snapshot.wifiTransferStatus != null) {
+        _transferStatus = snapshot.wifiTransferStatus;
       }
       if (snapshot.seismicAlarmMonitoring != null) {
         _seismicAlarmMonitoring = snapshot.seismicAlarmMonitoring!;
@@ -721,6 +773,69 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
     }
   }
 
+  Future<void> _refreshMessages() async {
+    if (_loadingMessages || _refreshingMessages || _clearingReceivedMessages) {
+      return;
+    }
+    setState(() => _refreshingMessages = true);
+    try {
+      if (_bleActive) {
+        await _bleNodeService.refreshScan();
+      } else {
+        await _startNodeService();
+      }
+
+      final backgroundPayloads = await _bleNodeService.loadBackgroundMessages();
+      final store = _messageStore;
+      if (store == null) {
+        throw StateError('El almacenamiento de mensajes aún no está listo.');
+      }
+      final backgroundMessages = backgroundPayloads
+          .map((payload) => LocalMessage.fromJson(jsonDecode(payload)))
+          .where((message) => !message.isExpired)
+          .toList();
+      for (final message in backgroundMessages) {
+        await store.addIfNew(message);
+      }
+
+      final messagesById = <String, LocalMessage>{
+        for (final message in _messages)
+          if (!message.isExpired) message.id: message,
+        for (final message in store.loadMessages())
+          if (!message.isExpired) message.id: message,
+      };
+      final refreshedMessages = messagesById.values.toList()
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      if (!mounted) return;
+      setState(() {
+        _messages
+          ..clear()
+          ..addAll(refreshedMessages);
+        _bleError = null;
+        _storageError = null;
+      });
+      _showTransferStatus(
+        'Búsqueda BLE actualizada; se sincronizaron los mensajes guardados.',
+      );
+    } on FormatException catch (error) {
+      if (mounted) {
+        setState(() {
+          _storageError = 'No se pudieron actualizar los mensajes: $error';
+        });
+      }
+    } on StateError catch (error) {
+      if (mounted) _showStorageError(error.message);
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(() {
+          _bleError = error.message ?? 'No se pudo buscar mensajes nuevos.';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _refreshingMessages = false);
+    }
+  }
+
   Future<void> _broadcastMessage(
     LocalMessage message, {
     String? excludedAddress,
@@ -748,6 +863,26 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
     }
   }
 
+  Future<void> _retryWifiDirect() async {
+    try {
+      await _bleNodeService.startPhotoTransport();
+    } on PlatformException catch (error) {
+      _showTransferStatus(
+        error.message ?? 'No se pudo activar el transporte de fotos.',
+      );
+    }
+  }
+
+  Future<void> _openWifiSettings() async {
+    try {
+      await _bleNodeService.openWifiSettings();
+    } on PlatformException catch (error) {
+      _showTransferStatus(
+        error.message ?? 'No se pudieron abrir los ajustes de Wi-Fi.',
+      );
+    }
+  }
+
   Future<void> _confirmClearAllMessages() async {
     final messageCount = _messages.length;
     if (messageCount == 0 || _clearingReceivedMessages) return;
@@ -758,7 +893,8 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
         content: Text(
           '¿Seguro deseas eliminar todo el historial? Se borrarán '
           '$messageCount mensajes de este dispositivo, incluidos los que '
-          'recibiste y los que creaste aquí.',
+          'recibiste y los que creaste aquí. También se eliminarán las fotos '
+          'guardadas para retransmisión.',
         ),
         actions: [
           TextButton(
@@ -892,6 +1028,8 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
                     isActive: _bleActive,
                     nodes: _nearbyNodes,
                     transferStatus: _transferStatus,
+                    onRetryWifiDirect: _retryWifiDirect,
+                    onOpenWifiSettings: _openWifiSettings,
                   ),
                   const SizedBox(height: 16),
                   _QuickHelpActionsCard(
@@ -904,6 +1042,7 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
                     onReportRobbery: () => _reportHomeIncident(
                       title: 'Reportar un robo en casa',
                       alertText: '🚨 ROBO EN CASA',
+                      allowEvidencePhoto: true,
                     ),
                     onReportMissingPerson: _reportMissingPerson,
                     onReportMissingPet: _reportMissingPet,
@@ -973,27 +1112,55 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
                     ],
                   ),
                   const SizedBox(height: 8),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: TextButton.icon(
-                      key: const Key('clear-all-messages'),
-                      onPressed:
-                          _messages.isNotEmpty &&
-                              !_clearingReceivedMessages &&
-                              !_loadingMessages
-                          ? _confirmClearAllMessages
-                          : null,
-                      icon: _clearingReceivedMessages
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.delete_outline_rounded),
-                      label: Text(
-                        _clearingReceivedMessages ? 'Borrando…' : 'Borrar todo',
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      TextButton.icon(
+                        key: const Key('refresh-messages'),
+                        onPressed:
+                            _refreshingMessages ||
+                                _loadingMessages ||
+                                _clearingReceivedMessages ||
+                                _bleStarting
+                            ? null
+                            : _refreshMessages,
+                        icon: _refreshingMessages
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.refresh_rounded),
+                        label: Text(
+                          _refreshingMessages ? 'Buscando…' : 'Recargar',
+                        ),
                       ),
-                    ),
+                      TextButton.icon(
+                        key: const Key('clear-all-messages'),
+                        onPressed:
+                            _messages.isNotEmpty &&
+                                !_clearingReceivedMessages &&
+                                !_loadingMessages
+                            ? _confirmClearAllMessages
+                            : null,
+                        icon: _clearingReceivedMessages
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.delete_outline_rounded),
+                        label: Text(
+                          _clearingReceivedMessages
+                              ? 'Borrando…'
+                              : 'Borrar todo',
+                        ),
+                      ),
+                    ],
                   ),
                   const SizedBox(height: 8),
                   if (_storageError != null)
@@ -1006,7 +1173,11 @@ class _NetworkHomePageState extends State<NetworkHomePage> {
                     ..._messages.map(
                       (message) => Padding(
                         padding: const EdgeInsets.only(bottom: 10),
-                        child: _MessageCard(message: message),
+                        child: _MessageCard(
+                          message: message,
+                          wifiTransferStatus: _transferStatus,
+                          onOpenWifiSettings: _openWifiSettings,
+                        ),
                       ),
                     ),
                   const SizedBox(height: 18),
@@ -1098,7 +1269,7 @@ class _TopBar extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'ENLACE',
+                'NEBULA',
                 style: Theme.of(context).textTheme.labelSmall?.copyWith(
                   color: Theme.of(context).colorScheme.onSurfaceVariant,
                   fontWeight: FontWeight.w800,
@@ -1314,11 +1485,15 @@ class _NearbyNodesCard extends StatelessWidget {
     required this.isActive,
     required this.nodes,
     required this.transferStatus,
+    required this.onRetryWifiDirect,
+    required this.onOpenWifiSettings,
   });
 
   final bool isActive;
   final List<NearbyNode> nodes;
   final String? transferStatus;
+  final VoidCallback onRetryWifiDirect;
+  final VoidCallback onOpenWifiSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -1365,7 +1540,7 @@ class _NearbyNodesCard extends StatelessWidget {
           if (nodes.isEmpty)
             Text(
               isActive
-                  ? 'Buscando teléfonos Enlace próximos…'
+                  ? 'Buscando teléfonos NEBULA próximos…'
                   : 'Activa Bluetooth para buscar teléfonos próximos.',
               style: TextStyle(
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -1431,6 +1606,29 @@ class _NearbyNodesCard extends StatelessWidget {
                 height: 1.35,
               ),
             ),
+            if (transferStatus!.toLowerCase().contains('wifi') ||
+                transferStatus!.toLowerCase().contains('wi-fi')) ...[
+              const SizedBox(height: 4),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  onPressed:
+                      transferStatus!.toLowerCase().contains('activa wi-fi')
+                      ? onOpenWifiSettings
+                      : onRetryWifiDirect,
+                  icon: Icon(
+                    transferStatus!.toLowerCase().contains('activa wi-fi')
+                        ? Icons.wifi
+                        : Icons.refresh,
+                  ),
+                  label: Text(
+                    transferStatus!.toLowerCase().contains('activa wi-fi')
+                        ? 'Activar Wi-Fi'
+                        : 'Reintentar Wi-Fi Direct',
+                  ),
+                ),
+              ),
+            ],
           ],
           if (nodes.isNotEmpty) ...[
             const SizedBox(height: 7),
@@ -2103,6 +2301,7 @@ class _MissingReportDetails {
     this.clothing = '',
     this.category,
     this.breed = '',
+    this.photo,
   });
 
   final String lastSeen;
@@ -2111,6 +2310,7 @@ class _MissingReportDetails {
   final String clothing;
   final String? category;
   final String breed;
+  final PhotoAttachment? photo;
 }
 
 class _MissingReportDialog extends StatefulWidget {
@@ -2131,6 +2331,9 @@ class _MissingReportDialogState extends State<_MissingReportDialog> {
   final _breedController = TextEditingController();
   final _characteristicsController = TextEditingController();
   String? _category;
+  PhotoAttachment? _photo;
+  bool _pickingPhoto = false;
+  String? _photoError;
 
   @override
   void dispose() {
@@ -2145,6 +2348,26 @@ class _MissingReportDialogState extends State<_MissingReportDialog> {
   String? _requiredField(String? value) =>
       value == null || value.trim().isEmpty ? 'Completa este campo.' : null;
 
+  Future<void> _pickPhoto() async {
+    if (_pickingPhoto) return;
+    setState(() {
+      _pickingPhoto = true;
+      _photoError = null;
+    });
+    try {
+      final photo = await BleNodeService().pickPhoto();
+      if (mounted) setState(() => _photo = photo);
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(
+          () => _photoError = error.message ?? 'No se pudo cargar la foto.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _pickingPhoto = false);
+    }
+  }
+
   void _submit() {
     if (!_formKey.currentState!.validate()) return;
     Navigator.pop(
@@ -2156,6 +2379,7 @@ class _MissingReportDialogState extends State<_MissingReportDialog> {
         clothing: _clothingController.text.trim(),
         category: _category,
         breed: _breedController.text.trim(),
+        photo: _photo,
       ),
     );
   }
@@ -2224,6 +2448,63 @@ class _MissingReportDialogState extends State<_MissingReportDialog> {
                     ),
                   ),
                 ],
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  key: Key(
+                    isPet
+                        ? 'select-missing-pet-photo'
+                        : 'select-missing-person-photo',
+                  ),
+                  onPressed: _pickingPhoto ? null : _pickPhoto,
+                  icon: _pickingPhoto
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.add_a_photo_outlined),
+                  label: Text(
+                    _photo == null
+                        ? 'Añadir foto (opcional, original hasta 20 MB)'
+                        : 'Cambiar foto',
+                  ),
+                ),
+                if (_photo != null) ...[
+                  const SizedBox(height: 8),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: Image.file(
+                      File(_photo!.path),
+                      height: 150,
+                      width: double.infinity,
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                  Text(
+                    'Copia optimizada: ${_photo!.bytes ~/ 1024} KB',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  TextButton.icon(
+                    onPressed: () => setState(() => _photo = null),
+                    icon: const Icon(Icons.delete_outline),
+                    label: const Text('Quitar foto'),
+                  ),
+                ],
+                if (_photoError != null)
+                  Text(
+                    _photoError!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                const Text(
+                  'La foto se compartirá con los nodos NEBULA y podrá '
+                  'reenviarse por Wi-Fi Direct durante 24 horas. NEBULA '
+                  'prepara una copia JPEG optimizada de hasta 1600 px para '
+                  'acelerar el envío; la foto original no se modifica. No es '
+                  'privada.',
+                  style: TextStyle(fontSize: 12, height: 1.35),
+                ),
                 if (isPet) ...[
                   const SizedBox(height: 10),
                   TextFormField(
@@ -2305,6 +2586,129 @@ class _MissingReportDialogState extends State<_MissingReportDialog> {
   }
 }
 
+class _IncidentEvidenceSelection {
+  const _IncidentEvidenceSelection({this.photo});
+
+  final PhotoAttachment? photo;
+}
+
+class _IncidentEvidenceDialog extends StatefulWidget {
+  const _IncidentEvidenceDialog();
+
+  @override
+  State<_IncidentEvidenceDialog> createState() =>
+      _IncidentEvidenceDialogState();
+}
+
+class _IncidentEvidenceDialogState extends State<_IncidentEvidenceDialog> {
+  PhotoAttachment? _photo;
+  bool _pickingPhoto = false;
+  String? _photoError;
+
+  Future<void> _pickPhoto() async {
+    if (_pickingPhoto) return;
+    setState(() {
+      _pickingPhoto = true;
+      _photoError = null;
+    });
+    try {
+      final photo = await BleNodeService().pickPhoto();
+      if (mounted && photo != null) setState(() => _photo = photo);
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(
+          () => _photoError = error.message ?? 'No se pudo cargar la foto.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _pickingPhoto = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Evidencia del robo'),
+      content: SizedBox(
+        width: 440,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Puedes adjuntar una foto de evidencia (opcional, original '
+                'hasta 20 MB). NEBULA prepara una copia JPEG optimizada de '
+                'hasta 1600 px para acelerar el envío; la foto original no '
+                'se modifica. '
+                'Se compartirá con nodos NEBULA cercanos y podrá reenviarse '
+                'durante 24 horas; no es privada.',
+                style: TextStyle(fontSize: 13, height: 1.4),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                key: const Key('select-robbery-photo'),
+                onPressed: _pickingPhoto ? null : _pickPhoto,
+                icon: _pickingPhoto
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.add_a_photo_outlined),
+                label: Text(_photo == null ? 'Añadir foto' : 'Cambiar foto'),
+              ),
+              if (_photo != null) ...[
+                const SizedBox(height: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Image.file(
+                    File(_photo!.path),
+                    height: 150,
+                    width: double.infinity,
+                    fit: BoxFit.cover,
+                  ),
+                ),
+                Text(
+                  'Copia optimizada: ${_photo!.bytes ~/ 1024} KB',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                TextButton.icon(
+                  onPressed: () => setState(() => _photo = null),
+                  icon: const Icon(Icons.delete_|outline),
+                  label: const Text('Quitar foto'),
+                ),
+              ],
+              if (_photoError != null)
+                Text(
+                  _photoError!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          key: const Key('cancel-robbery-report'),
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancelar'),
+        ),
+        FilledButton(
+          key: const Key('continue-robbery-report'),
+          onPressed: _pickingPhoto
+              ? null
+              : () => Navigator.pop(
+                  context,
+                  _IncidentEvidenceSelection(photo: _photo),
+                ),
+          child: const Text('Continuar'),
+        ),
+      ],
+    );
+  }
+}
+
 class _QuickHelpActionsCard extends StatelessWidget {
   const _QuickHelpActionsCard({
     required this.busy,
@@ -2345,9 +2749,10 @@ class _QuickHelpActionsCard extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           const Text(
-            'El GPS obtiene coordenadas sin Wi-Fi. Los avisos viajan por '
-            'Bluetooth LE si el nodo está activo; sin él solo se guardan aquí. '
-            'No sustituye una llamada a emergencias.',
+            'Los avisos viajan por Bluetooth LE. Puedes adjuntar fotos a los '
+            'reportes de familiares, mascotas y evidencia de robo; se '
+            'distribuyen por Wi-Fi Direct, sin Internet, y pueden tardar. '
+            'No sustituye emergencias.',
             style: TextStyle(
               color: Color(0xFF796B62),
               fontSize: 11,
@@ -2435,9 +2840,15 @@ class _QuickHelpActionsCard extends StatelessWidget {
 }
 
 class _MessageCard extends StatelessWidget {
-  const _MessageCard({required this.message});
+  const _MessageCard({
+    required this.message,
+    required this.wifiTransferStatus,
+    required this.onOpenWifiSettings,
+  });
 
   final LocalMessage message;
+  final String? wifiTransferStatus;
+  final VoidCallback onOpenWifiSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -2483,6 +2894,63 @@ class _MessageCard extends StatelessWidget {
                     height: 1.4,
                   ),
                 ),
+                if (message.photoId != null) ...[
+                  const SizedBox(height: 9),
+                  FutureBuilder<String?>(
+                    future: BleNodeService().getPhotoPath(message.photoId!),
+                    builder: (context, snapshot) {
+                      final path = snapshot.data;
+                      if (path == null) {
+                        final status = wifiTransferStatus;
+                        final wifiOff =
+                            status?.toLowerCase().contains('activa wi-fi') ??
+                            false;
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              wifiOff
+                                  ? 'Foto pendiente · activa Wi-Fi para iniciar la transferencia.'
+                                  : status ?? 'Foto pendiente · NEBULA buscará nodos cercanos para transferirla.',
+                              style: TextStyle(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant,
+                                fontSize: 12,
+                                height: 1.35,
+                              ),
+                            ),
+                            if (wifiOff)
+                              TextButton.icon(
+                                onPressed: onOpenWifiSettings,
+                                icon: const Icon(Icons.wifi),
+                                label: const Text('Activar Wi-Fi'),
+                              ),
+                          ],
+                        );
+                      }
+                      return GestureDetector(
+                        onTap: () => showDialog<void>(
+                          context: context,
+                          builder: (context) => Dialog(
+                            child: InteractiveViewer(
+                              child: Image.file(File(path)),
+                            ),
+                          ),
+                        ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(11),
+                          child: Image.file(
+                            File(path),
+                            height: 180,
+                            width: double.infinity,
+                            fit: BoxFit.cover,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ],
                 const SizedBox(height: 7),
                 Text(
                   '${message.senderName ?? 'Remitente sin nombre'} · '
